@@ -1,0 +1,19 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+backend/.venv/
+
+# Private keys
+backend/secrets/
+*.pem
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
