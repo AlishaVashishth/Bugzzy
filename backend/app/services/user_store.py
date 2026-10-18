@@ -26,6 +26,16 @@ _installations_by_user_id: dict[int, list[dict[str, Any]]] = {}
 # local user id. A user must explicitly choose; we never auto-connect.
 _connected_by_user_id: dict[int, int] = {}
 
+# Repository selections, keyed by (local user id, installation id). Each
+# value is a list of repository ids the user picked for that installation.
+_selected_repos: dict[tuple[int, int], list[int]] = {}
+
+
+def _clear_selections_for(local_user_id: int, installation_id: int) -> None:
+    """Internal helper: forget a user's selections for one installation."""
+
+    _selected_repos.pop((local_user_id, installation_id), None)
+
 
 def upsert_user(github_user: dict[str, Any]) -> dict[str, Any]:
     """Insert or update a user and return the stored record.
@@ -65,6 +75,7 @@ def reset_store() -> None:
     _USERS_BY_GITHUB_ID.clear()
     _installations_by_user_id.clear()
     _connected_by_user_id.clear()
+    _selected_repos.clear()
     _next_id = 1
 
 
@@ -91,7 +102,9 @@ def set_user_installations(
             for item in _installations_by_user_id[local_user_id]
         )
         if not still_present:
+            # The connection is gone, so its selections are meaningless too.
             del _connected_by_user_id[local_user_id]
+            _clear_selections_for(local_user_id, connected)
 
 
 def get_user_installations(local_user_id: int) -> list[dict[str, Any]]:
@@ -103,18 +116,50 @@ def get_user_installations(local_user_id: int) -> list[dict[str, Any]]:
 def set_connected_installation(
     local_user_id: int, installation_id: int | None
 ) -> None:
-    """Mark which installation is connected for a user (None clears it)."""
+    """Mark which installation is connected for a user (None clears it).
+
+    Disconnecting, or switching to a different installation, also clears the
+    user's repository selections for the installation they are leaving.
+    """
+
+    previous = _connected_by_user_id.get(local_user_id)
 
     if installation_id is None:
+        if previous is not None:
+            _clear_selections_for(local_user_id, previous)
         _connected_by_user_id.pop(local_user_id, None)
-    else:
-        _connected_by_user_id[local_user_id] = installation_id
+        return
+
+    if previous is not None and previous != installation_id:
+        _clear_selections_for(local_user_id, previous)
+
+    _connected_by_user_id[local_user_id] = installation_id
 
 
 def get_connected_installation(local_user_id: int) -> int | None:
     """Return the user's connected installation id, or None."""
 
     return _connected_by_user_id.get(local_user_id)
+
+
+def set_selected_repositories(
+    local_user_id: int, installation_id: int, repo_ids: list[int]
+) -> None:
+    """Replace the user's selected repository ids for one installation."""
+
+    _selected_repos[(local_user_id, installation_id)] = list(repo_ids)
+
+
+def get_selected_repositories(local_user_id: int, installation_id: int) -> list[int]:
+    """Return the user's selected repository ids for one installation."""
+
+    return list(_selected_repos.get((local_user_id, installation_id), []))
+
+
+def clear_selected_repositories(local_user_id: int, installation_id: int) -> None:
+    """Forget the user's selected repository ids for one installation."""
+
+    _clear_selections_for(local_user_id, installation_id)
 
 
 def get_user_by_id(local_id: int) -> dict[str, Any] | None:

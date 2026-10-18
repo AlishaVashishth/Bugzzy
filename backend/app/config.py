@@ -89,6 +89,16 @@ class Settings:
         return f"{parts.scheme}://{parts.netloc}"
 
     @property
+    def backend_origin(self) -> str:
+        """Just the scheme + host of this backend, e.g. http://localhost:8000.
+
+        Derived from the OAuth redirect_uri, which points at this server.
+        """
+
+        parts = urlsplit(self.redirect_uri)
+        return f"{parts.scheme}://{parts.netloc}"
+
+    @property
     def is_production(self) -> bool:
         """True only when APP_ENV is exactly "production".
 

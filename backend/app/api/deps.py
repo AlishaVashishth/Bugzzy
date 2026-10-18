@@ -101,8 +101,18 @@ async def verify_csrf(
 
     # 1. Origin check. Browsers send Origin on cross-site requests and on
     #    non-GET requests; when it is absent we rely on the token check.
+    #
+    # In development only, we also accept this backend's own origin. That
+    # lets you test POSTs from the browser console (e.g. on the API docs
+    # page) without setting up the frontend. This is for development
+    # testing only: in production the frontend origin is the only one
+    # accepted.
+    allowed_origins = {settings.frontend_origin}
+    if not settings.is_production:
+        allowed_origins.add(settings.backend_origin)
+
     origin = request.headers.get("origin")
-    if origin is not None and origin != settings.frontend_origin:
+    if origin is not None and origin not in allowed_origins:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=_CSRF_FAILED
         )

@@ -12,7 +12,9 @@ stores the private key or the JWT in a message, so failures stay safe.
 
 from __future__ import annotations
 
+import asyncio
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,10 @@ GITHUB_API_VERSION = "2022-11-28"
 # How long to wait for GitHub before giving up (in seconds).
 REQUEST_TIMEOUT = 15.0
 
+# Only reuse a cached installation token while it still has this much life
+# left. Tokens last about an hour, so 5 minutes of headroom is plenty.
+TOKEN_REFRESH_MARGIN_SECONDS = 5 * 60
+
 
 class GitHubAuthError(Exception):
     """Raised when our credentials are wrong (bad key, bad JWT, HTTP 401)."""
@@ -40,6 +46,14 @@ class GitHubAPIError(Exception):
 
 class GitHubNetworkError(Exception):
     """Raised when we cannot reach GitHub (timeout or connection failure)."""
+
+
+class InstallationUnavailableError(Exception):
+    """Raised when an installation is gone, suspended, or no longer shared.
+
+    GitHub answers 404 or 403 when we ask for a token for such an
+    installation. Callers usually respond by asking the user to reconnect.
+    """
 
 
 def load_private_key() -> str:
@@ -170,4 +184,145 @@ def reset_app_slug_cache() -> None:
 
     global _app_slug_cache
     _app_slug_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Installation access tokens
+# ---------------------------------------------------------------------------
+# An installation token lets us act on an installation's repositories. It
+# lasts about an hour and must NEVER leave the server: it is never returned
+# in a response and never logged.
+#
+# Cache shape: {installation_id: (token, expires_at_epoch_seconds)}.
+_token_cache: dict[int, tuple[str, float]] = {}
+
+# One lock per installation id so that, when several requests need a token
+# at once, only one of them actually calls GitHub. The guard lock protects
+# creating the per-installation locks themselves.
+_token_locks: dict[int, asyncio.Lock] = {}
+_token_locks_guard = asyncio.Lock()
+
+
+def _parse_iso_to_epoch(value: str) -> float:
+    """Turn GitHub's ISO 8601 "expires_at" into epoch seconds.
+
+    If it cannot be parsed we fall back to "about an hour from now" so we
+    still cache something sane.
+    """
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, AttributeError):
+        return time.time() + 3600
+
+
+async def _get_token_lock(installation_id: int) -> asyncio.Lock:
+    """Return (creating if needed) the lock for one installation id."""
+
+    lock = _token_locks.get(installation_id)
+    if lock is None:
+        async with _token_locks_guard:
+            lock = _token_locks.get(installation_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                _token_locks[installation_id] = lock
+    return lock
+
+
+def _cached_token_is_fresh(installation_id: int) -> str | None:
+    """Return the cached token if it still has enough time left."""
+
+    cached = _token_cache.get(installation_id)
+    if cached is None:
+        return None
+    token, expires_at = cached
+    if expires_at - time.time() > TOKEN_REFRESH_MARGIN_SECONDS:
+        return token
+    return None
+
+
+async def get_installation_token(installation_id: int) -> str:
+    """Return a valid installation token, fetching one when needed.
+
+    The token is cached in memory per installation and reused while it has
+    more than TOKEN_REFRESH_MARGIN_SECONDS left. A per-installation lock
+    makes sure concurrent requests do not fetch several tokens at once.
+    """
+
+    fresh = _cached_token_is_fresh(installation_id)
+    if fresh is not None:
+        return fresh
+
+    lock = await _get_token_lock(installation_id)
+    async with lock:
+        # Check again: another request may have filled the cache while we
+        # were waiting for the lock.
+        fresh = _cached_token_is_fresh(installation_id)
+        if fresh is not None:
+            return fresh
+
+        app_jwt = create_app_jwt()
+
+        headers = {
+            "Authorization": f"Bearer {app_jwt}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            "User-Agent": "bugzzy-app",
+        }
+        url = f"{GITHUB_API_BASE}/app/installations/{installation_id}/access_tokens"
+
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                response = await client.post(url, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise GitHubNetworkError(
+                "Timed out while contacting GitHub. Please try again."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise GitHubNetworkError(
+                "Could not connect to GitHub. Please check your network."
+            ) from exc
+
+        # 404/403 means the installation was removed, suspended, or the app
+        # no longer has access to it.
+        if response.status_code in (403, 404):
+            raise InstallationUnavailableError(
+                "This GitHub installation is no longer available."
+            )
+        if response.status_code == 401:
+            raise GitHubAuthError(
+                "GitHub rejected our app credentials (401). "
+                "Check the App ID and private key."
+            )
+        if response.status_code >= 400:
+            raise GitHubAPIError(
+                f"GitHub returned an unexpected status: {response.status_code}."
+            )
+
+        data = response.json()
+        token = data.get("token")
+        if not token:
+            # Never echo the body: it would contain the token.
+            raise GitHubAPIError("GitHub did not return an installation token.")
+
+        expires_at = _parse_iso_to_epoch(str(data.get("expires_at") or ""))
+        _token_cache[installation_id] = (token, expires_at)
+        return token
+
+
+def invalidate_installation_token(installation_id: int) -> None:
+    """Forget the cached token for one installation (e.g. after a 401)."""
+
+    _token_cache.pop(installation_id, None)
+
+
+def reset_token_cache() -> None:
+    """Clear all cached tokens and locks. Used by tests."""
+
+    _token_cache.clear()
+    _token_locks.clear()
+
 
