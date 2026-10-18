@@ -16,6 +16,7 @@ data is kept server-side and never given to the browser.
 from __future__ import annotations
 
 import json
+import logging
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -40,7 +41,11 @@ from app.services.github_app import (
     GitHubAuthError,
     GitHubNetworkError,
 )
-from app.services.user_store import upsert_user
+from app.services.user_store import set_user_installations, upsert_user
+
+# A logger for this module. We only ever log safe, fixed messages: never a
+# token, a code, or a session id.
+logger = logging.getLogger(__name__)
 
 # All routes here live under /api/v1/auth.
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
@@ -154,12 +159,28 @@ async def github_callback(
     code: str | None = Query(default=None),
     state: str | None = Query(default=None),
     error: str | None = Query(default=None),
+    setup_action: str | None = Query(default=None),
+    installation_id: str | None = Query(default=None),
 ) -> Response:
     """Finish login: validate, exchange the code, then start a session.
 
-    On success we create a brand new session and redirect the browser to
-    the frontend. All the validation below is unchanged from Step 2.
+    This endpoint handles two cases:
+
+    * Normal login: we sent the user to GitHub ourselves, so a "state" value
+      and our oauth cookie are present. We verify them strictly.
+    * Post-install redirect: the App is set to request user authorization
+      during installation, so GitHub can send the user here right after
+      they install. That request has a code and setup_action but no state
+      and no cookie. We do NOT trust its installation_id; instead we send
+      the user through a clean login (which refreshes their installation
+      list). The code is never exchanged without a passing state check.
+
+    installation_id is accepted only so FastAPI does not reject the query
+    string. Its value is ignored for trust purposes and never stored.
     """
+
+    # We keep a reference to this purely to make the "ignored" intent clear.
+    _ = installation_id
 
     # Read the temporary OAuth cookie. It must be gone once this request
     # finishes, whatever the outcome.
@@ -187,19 +208,31 @@ async def github_callback(
     if error:
         return bad_request(f"GitHub login failed: {error}.")
 
-    # 2. The code and state must both be present in the query string.
+    # 2. The code must be present. (Its value is never logged.)
     if not code:
         return bad_request("Missing 'code' from GitHub.")
+
+    # 2b. Post-install redirect. There is no state and no cookie, so this is
+    #     not a login we started. Send the user to a clean login instead of
+    #     exchanging this code. This keeps the strict state check below.
+    if setup_action and not state and not cookie_value:
+        resp = RedirectResponse(
+            url="/api/v1/auth/github/login", status_code=302
+        )
+        _clear_oauth_cookie(resp)
+        return resp
+
+    # 3. The state must be present in the query string.
     if not state:
         return bad_request("Missing 'state' from GitHub.")
 
-    # 3. The cookie must exist and its state must match what GitHub returned.
+    # 4. The cookie must exist and its state must match what GitHub returned.
     if not cookie_value:
         return bad_request("Login session expired or missing. Please try again.")
     if not verify_state(stored_state, state):
         return bad_request("State check failed. Please try again.")
 
-    # 4. Trade the code for a user access token (used once, then discarded).
+    # 5. Trade the code for a user access token (used once, then discarded).
     try:
         access_token = await github_oauth.exchange_code_for_token(
             code, code_verifier
@@ -217,20 +250,33 @@ async def github_callback(
         resp = JSONResponse(status_code=502, content={"detail": str(exc)})
         _clear_oauth_cookie(resp)
         return resp
+
+    # 6. While we still have the token, list this user's installations. This
+    #    is the ONLY trusted source of installation ids. If it fails, login
+    #    must still succeed, just with an empty list.
+    try:
+        installations = await github_oauth.fetch_user_installations(access_token)
+    except (GitHubAuthError, GitHubAPIError, GitHubNetworkError):
+        logger.warning(
+            "Could not fetch GitHub installations during login; "
+            "continuing with an empty list."
+        )
+        installations = []
     # The token is intentionally not stored anywhere. It lives only in the
     # local variable above and is dropped as soon as this request ends.
 
-    # 5. Save the user locally.
+    # 7. Save the user locally and replace their installation list.
     user = upsert_user(github_user)
+    set_user_installations(user["id"], installations)
 
-    # 6. If this browser already has a session, remove it first. Every login
+    # 8. If this browser already has a session, remove it first. Every login
     #    gets a brand new session id; we never reuse an old one.
     store = get_session_store()
     existing_raw_id = get_raw_session_id(request)
     if existing_raw_id:
         store.delete(existing_raw_id)
 
-    # 7. Create the new session and send the browser to the frontend.
+    # 9. Create the new session and send the browser to the frontend.
     raw_session_id, _csrf_token = store.create(user["id"])
 
     response = RedirectResponse(url=get_settings().frontend_url, status_code=302)

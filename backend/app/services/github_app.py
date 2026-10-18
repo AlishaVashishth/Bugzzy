@@ -136,3 +136,38 @@ async def get_app_info() -> dict[str, Any]:
         )
 
     return response.json()
+
+
+# The app's URL slug never changes, so we remember it after the first
+# successful lookup instead of calling GitHub on every request.
+_app_slug_cache: str | None = None
+
+
+async def get_app_slug() -> str:
+    """Return the GitHub App's slug (used to build the install URL).
+
+    The slug comes from get_app_info(). It is cached in memory after the
+    first success. If the lookup fails, the caller decides how to map the
+    exception (e.g. 502/503); we never invent a slug.
+    """
+
+    global _app_slug_cache
+
+    if _app_slug_cache is not None:
+        return _app_slug_cache
+
+    data = await get_app_info()
+    slug = data.get("slug")
+    if not slug:
+        raise GitHubAPIError("GitHub did not return an app slug.")
+
+    _app_slug_cache = slug
+    return slug
+
+
+def reset_app_slug_cache() -> None:
+    """Forget the cached slug. Used by tests."""
+
+    global _app_slug_cache
+    _app_slug_cache = None
+

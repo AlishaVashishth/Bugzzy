@@ -49,8 +49,12 @@ def fake_github(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
             "avatar_url": "https://example.invalid/avatar.png",
         }
 
+    async def fake_installations(access_token: str) -> list[dict]:
+        return []
+
     monkeypatch.setattr(github_oauth, "exchange_code_for_token", fake_exchange)
     monkeypatch.setattr(github_oauth, "fetch_github_user", fake_fetch)
+    monkeypatch.setattr(github_oauth, "fetch_user_installations", fake_installations)
     return {"token": FAKE_TOKEN}
 
 

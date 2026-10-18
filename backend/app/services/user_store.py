@@ -18,6 +18,14 @@ _USERS_BY_GITHUB_ID: dict[int, dict[str, Any]] = {}
 # Simple counter used to hand out local ids, starting at 1.
 _next_id = 1
 
+# Per-user installation lists, keyed by the LOCAL user id. The list is the
+# trusted set of installation ids GitHub returned for that user at login.
+_installations_by_user_id: dict[int, list[dict[str, Any]]] = {}
+
+# Which installation each user has chosen to "connect" in Bugzzy, keyed by
+# local user id. A user must explicitly choose; we never auto-connect.
+_connected_by_user_id: dict[int, int] = {}
+
 
 def upsert_user(github_user: dict[str, Any]) -> dict[str, Any]:
     """Insert or update a user and return the stored record.
@@ -55,7 +63,58 @@ def reset_store() -> None:
 
     global _next_id
     _USERS_BY_GITHUB_ID.clear()
+    _installations_by_user_id.clear()
+    _connected_by_user_id.clear()
     _next_id = 1
+
+
+def set_user_installations(
+    local_user_id: int, installations: list[dict[str, Any]]
+) -> None:
+    """Replace a user's stored installation list with a fresh one.
+
+    This is called at login with the trusted list from GitHub. If the user
+    had connected an installation that no longer appears in the new list,
+    we clear the connection so they cannot keep using a stale id.
+
+    Note: we deliberately do NOT auto-connect when there is exactly one
+    installation. The user must always choose.
+    """
+
+    # Store a copy so later changes to the caller's list do not leak in.
+    _installations_by_user_id[local_user_id] = [dict(item) for item in installations]
+
+    connected = _connected_by_user_id.get(local_user_id)
+    if connected is not None:
+        still_present = any(
+            item.get("installation_id") == connected
+            for item in _installations_by_user_id[local_user_id]
+        )
+        if not still_present:
+            del _connected_by_user_id[local_user_id]
+
+
+def get_user_installations(local_user_id: int) -> list[dict[str, Any]]:
+    """Return a copy of the user's trusted installation list."""
+
+    return [dict(item) for item in _installations_by_user_id.get(local_user_id, [])]
+
+
+def set_connected_installation(
+    local_user_id: int, installation_id: int | None
+) -> None:
+    """Mark which installation is connected for a user (None clears it)."""
+
+    if installation_id is None:
+        _connected_by_user_id.pop(local_user_id, None)
+    else:
+        _connected_by_user_id[local_user_id] = installation_id
+
+
+def get_connected_installation(local_user_id: int) -> int | None:
+    """Return the user's connected installation id, or None."""
+
+    return _connected_by_user_id.get(local_user_id)
 
 
 def get_user_by_id(local_id: int) -> dict[str, Any] | None:

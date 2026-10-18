@@ -40,6 +40,13 @@ GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 # can set this to False to fall back to state-only protection.
 USE_PKCE = True
 
+# Safety cap for installation pagination. GitHub returns pages of up to 100
+# items; we stop after this many pages even if GitHub claims there are more.
+MAX_INSTALLATION_PAGES = 10
+
+# GitHub returns at most this many installations per page.
+INSTALLATIONS_PER_PAGE = 100
+
 
 def build_authorize_url(state: str, code_challenge: str | None) -> str:
     """Build the URL we redirect the browser to so GitHub can log the user in.
@@ -168,3 +175,97 @@ async def fetch_github_user(access_token: str) -> dict[str, Any]:
         "name": data.get("name"),
         "avatar_url": data.get("avatar_url"),
     }
+
+
+async def fetch_user_installations(access_token: str) -> list[dict[str, Any]]:
+    """List the GitHub App installations that belong to this user.
+
+    IMPORTANT: this is the only trusted source of installation ids. A user
+    may only use ids that GitHub returned here for them. We never trust an
+    installation_id that arrives from a URL or request body.
+
+    Only installations for *our* app (app_id == settings.app_id) are kept;
+    any other apps the user has installed are ignored.
+
+    Returns a list of small dictionaries with just the fields we need.
+    """
+
+    settings = get_settings()
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "User-Agent": "bugzzy-app",
+    }
+
+    results: list[dict[str, Any]] = []
+    raw_seen = 0
+    page = 1
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            # Follow pagination until we have every page, or we hit the cap.
+            while page <= MAX_INSTALLATION_PAGES:
+                response = await client.get(
+                    f"{GITHUB_API_BASE}/user/installations",
+                    headers=headers,
+                    params={"per_page": INSTALLATIONS_PER_PAGE, "page": page},
+                )
+
+                if response.status_code == 401:
+                    raise GitHubAuthError(
+                        "GitHub rejected the user access token (401)."
+                    )
+                if response.status_code >= 400:
+                    raise GitHubAPIError(
+                        "GitHub returned an unexpected status while listing "
+                        f"installations: {response.status_code}."
+                    )
+
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise GitHubAPIError(
+                        "GitHub returned an unexpected installations response."
+                    )
+
+                page_items = payload.get("installations") or []
+                raw_seen += len(page_items)
+
+                for item in page_items:
+                    # Ignore installations that belong to other GitHub Apps.
+                    if item.get("app_id") != settings.app_id:
+                        continue
+
+                    account = item.get("account") or {}
+                    results.append(
+                        {
+                            "installation_id": item.get("id"),
+                            "account_login": account.get("login"),
+                            "account_id": account.get("id"),
+                            "account_type": account.get("type"),
+                            "target_type": item.get("target_type"),
+                            "repository_selection": item.get("repository_selection"),
+                        }
+                    )
+
+                # Stop when a page comes back empty.
+                if not page_items:
+                    break
+
+                # Stop once we have seen every installation GitHub counted.
+                total_count = payload.get("total_count")
+                if isinstance(total_count, int) and raw_seen >= total_count:
+                    break
+
+                page += 1
+    except httpx.TimeoutException as exc:
+        raise GitHubNetworkError(
+            "Timed out while contacting GitHub. Please try again."
+        ) from exc
+    except httpx.RequestError as exc:
+        raise GitHubNetworkError(
+            "Could not connect to GitHub. Please check your network."
+        ) from exc
+
+    return results
