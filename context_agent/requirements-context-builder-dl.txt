@@ -1,0 +1,3 @@
+-r requirements-context-builder.txt
+torch>=2.2.0
+transformers>=4.40.0
