@@ -85,18 +85,22 @@ class PostgresStore(Store):
         insert_stmt = pg_insert(User).values(
             github_user_id=github_user_id,
             username=username,
+            name=github_user.get("name"),
             avatar_url=github_user.get("avatar_url"),
             last_login_at=func.now(),
+            updated_at=func.now(),
         )
         statement = insert_stmt.on_conflict_do_update(
             index_elements=[User.github_user_id],
             set_={
                 "username": insert_stmt.excluded.username,
+                "name": insert_stmt.excluded.name,
                 "avatar_url": insert_stmt.excluded.avatar_url,
                 "last_login_at": func.now(),
+                "updated_at": func.now(),
             },
         ).returning(
-            User.id, User.github_user_id, User.username, User.avatar_url
+            User.id, User.github_user_id, User.username, User.name, User.avatar_url
         )
 
         async with self._sessionmaker() as session:
@@ -108,15 +112,13 @@ class PostgresStore(Store):
             "id": row.id,
             "github_user_id": row.github_user_id,
             "username": row.username,
-            # The users table has no "name" column. Keep the key for the
-            # routes, but there is nothing to fill it with.
-            "name": None,
+            "name": row.name,
             "avatar_url": row.avatar_url,
         }
 
     async def get_user_by_id(self, local_user_id: int) -> dict | None:
         statement = select(
-            User.id, User.github_user_id, User.username, User.avatar_url
+            User.id, User.github_user_id, User.username, User.name, User.avatar_url
         ).where(User.id == local_user_id)
 
         async with self._sessionmaker() as session:
@@ -129,7 +131,7 @@ class PostgresStore(Store):
             "id": row.id,
             "github_user_id": row.github_user_id,
             "username": row.username,
-            "name": None,
+            "name": row.name,
             "avatar_url": row.avatar_url,
         }
 
