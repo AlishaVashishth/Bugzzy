@@ -23,14 +23,7 @@ from app.services.github_app import (
     InstallationUnavailableError,
 )
 from app.services.github_repositories import list_installation_repositories
-from app.services.user_store import (
-    clear_selected_repositories,
-    get_connected_installation,
-    get_selected_repositories,
-    get_user_installations,
-    set_connected_installation,
-    set_selected_repositories,
-)
+from app.services.store import Store, get_store
 
 # All routes here live under /api/v1/repositories.
 router = APIRouter(prefix="/api/v1/repositories", tags=["repositories"])
@@ -51,7 +44,7 @@ class RepositorySelectRequest(BaseModel):
     )
 
 
-def _require_connected_installation(user: dict) -> int:
+async def _require_connected_installation(user: dict, store: Store) -> int:
     """Return the user's connected installation id, or raise 409.
 
     We also double-check the id is still in the user's stored installation
@@ -59,7 +52,7 @@ def _require_connected_installation(user: dict) -> int:
     installation), we clear the connection and report 409.
     """
 
-    installation_id = get_connected_installation(user["id"])
+    installation_id = await store.get_connected_installation(user["id"])
     if installation_id is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -68,10 +61,10 @@ def _require_connected_installation(user: dict) -> int:
 
     known_ids = {
         item.get("installation_id")
-        for item in get_user_installations(user["id"])
+        for item in await store.get_user_installations(user["id"])
     }
     if installation_id not in known_ids:
-        set_connected_installation(user["id"], None)
+        await store.set_connected_installation(user["id"], None)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="No GitHub installation connected",
@@ -80,15 +73,17 @@ def _require_connected_installation(user: dict) -> int:
     return installation_id
 
 
-def _clear_connection(user: dict, installation_id: int) -> None:
+async def _clear_connection(
+    user: dict, installation_id: int, store: Store
+) -> None:
     """Forget the connection and any selections for one installation."""
 
-    clear_selected_repositories(user["id"], installation_id)
-    set_connected_installation(user["id"], None)
+    await store.clear_selected_repositories(user["id"], installation_id)
+    await store.set_connected_installation(user["id"], None)
 
 
 async def _load_repositories(
-    user: dict, installation_id: int, force_refresh: bool
+    user: dict, installation_id: int, force_refresh: bool, store: Store
 ) -> list[dict]:
     """Call the service and map its exceptions to clean HTTP errors."""
 
@@ -97,7 +92,7 @@ async def _load_repositories(
             installation_id, force_refresh=force_refresh
         )
     except InstallationUnavailableError:
-        _clear_connection(user, installation_id)
+        await _clear_connection(user, installation_id, store)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Installation is no longer available. Please reconnect.",
@@ -123,6 +118,7 @@ async def _load_repositories(
 async def list_repositories(
     refresh: bool = Query(default=False),
     user: dict = Depends(get_current_user),
+    store: Store = Depends(get_store),
 ) -> JSONResponse:
     """List the connected installation's repositories with selection flags.
 
@@ -130,10 +126,14 @@ async def list_repositories(
     fresh list from GitHub.
     """
 
-    installation_id = _require_connected_installation(user)
-    repositories = await _load_repositories(user, installation_id, refresh)
+    installation_id = await _require_connected_installation(user, store)
+    repositories = await _load_repositories(
+        user, installation_id, refresh, store
+    )
 
-    selected = set(get_selected_repositories(user["id"], installation_id))
+    selected = set(
+        await store.get_selected_repositories(user["id"], installation_id)
+    )
     items = [
         {**repo, "selected": repo.get("id") in selected} for repo in repositories
     ]
@@ -153,6 +153,7 @@ async def select_repositories(
     body: RepositorySelectRequest,
     user: dict = Depends(get_current_user),
     _csrf: None = Depends(verify_csrf),
+    store: Store = Depends(get_store),
 ) -> JSONResponse:
     """Save the repositories the user picked for the connected installation.
 
@@ -161,8 +162,10 @@ async def select_repositories(
     422. An empty list is allowed and clears the selection.
     """
 
-    installation_id = _require_connected_installation(user)
-    repositories = await _load_repositories(user, installation_id, True)
+    installation_id = await _require_connected_installation(user, store)
+    repositories = await _load_repositories(
+        user, installation_id, True, store
+    )
 
     accessible_ids = {repo.get("id") for repo in repositories}
 
@@ -180,5 +183,7 @@ async def select_repositories(
         if requested_id not in unique_ids:
             unique_ids.append(requested_id)
 
-    set_selected_repositories(user["id"], installation_id, unique_ids)
+    await store.set_selected_repositories(
+        user["id"], installation_id, unique_ids
+    )
     return JSONResponse(content={"selected_repository_ids": unique_ids})

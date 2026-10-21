@@ -5,9 +5,13 @@ Run it locally with:  uvicorn app.main:app --port 8000
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+from app.db.engine import dispose_engine
 
 from app.api.deps import get_current_user
 from app.api.routes.auth import router as auth_router
@@ -21,8 +25,19 @@ from app.services.github_app import (
     get_app_info,
 )
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Run startup/shutdown work.
+
+    On shutdown we close the database connection pool cleanly.
+    """
+
+    yield
+    await dispose_engine()
+
+
 # Create the FastAPI application with a human-friendly title.
-app = FastAPI(title="Bugzzy")
+app = FastAPI(title="Bugzzy", lifespan=lifespan)
 
 # Read settings once at startup so CORS can be configured below.
 _settings = get_settings()

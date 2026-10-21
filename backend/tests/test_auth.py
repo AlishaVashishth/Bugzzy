@@ -214,9 +214,9 @@ def test_same_user_twice_creates_one_user_record(
     )
 
     # Same GitHub user -> a single user record still.
-    from app.services.user_store import _USERS_BY_GITHUB_ID
+    from app.services.user_store import count_users
 
-    assert len(_USERS_BY_GITHUB_ID) == 1
+    assert count_users() == 1
 
 
 # --------------------------------------------------------------------------

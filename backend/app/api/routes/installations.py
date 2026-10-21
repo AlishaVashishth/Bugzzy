@@ -25,10 +25,10 @@ from app.services.github_app import (
     GitHubAuthError,
     GitHubNetworkError,
 )
-from app.services.user_store import (
-    get_connected_installation,
-    get_user_installations,
-    set_connected_installation,
+from app.services.store import (
+    InstallationNotAvailableError,
+    Store,
+    get_store,
 )
 
 # All routes here live under /api/v1/installations.
@@ -40,7 +40,10 @@ INSTALL_BASE_URL = "https://github.com/apps"
 
 
 @router.get("")
-async def list_installations(user: dict = Depends(get_current_user)) -> JSONResponse:
+async def list_installations(
+    user: dict = Depends(get_current_user),
+    store: Store = Depends(get_store),
+) -> JSONResponse:
     """List the current user's installations and which one is connected.
 
     NOTE: the list is a snapshot taken when the user last logged in. It is
@@ -51,8 +54,10 @@ async def list_installations(user: dict = Depends(get_current_user)) -> JSONResp
 
     return JSONResponse(
         content={
-            "installations": get_user_installations(user["id"]),
-            "connected_installation_id": get_connected_installation(user["id"]),
+            "installations": await store.get_user_installations(user["id"]),
+            "connected_installation_id": await store.get_connected_installation(
+                user["id"]
+            ),
         },
         headers={"Cache-Control": "no-store"},
     )
@@ -86,6 +91,7 @@ async def connect_installation(
     installation_id: int,
     user: dict = Depends(get_current_user),
     _csrf: None = Depends(verify_csrf),
+    store: Store = Depends(get_store),
 ) -> JSONResponse:
     """Connect one of the user's installations.
 
@@ -93,7 +99,7 @@ async def connect_installation(
     same message, so we never reveal whether an id exists for someone else.
     """
 
-    installations = get_user_installations(user["id"])
+    installations = await store.get_user_installations(user["id"])
     chosen = None
     for item in installations:
         if item.get("installation_id") == installation_id:
@@ -106,7 +112,15 @@ async def connect_installation(
             detail="Installation not found",
         )
 
-    set_connected_installation(user["id"], installation_id)
+    try:
+        await store.set_connected_installation(user["id"], installation_id)
+    except InstallationNotAvailableError:
+        # The store re-checks the list. Treat a mismatch the same way so we
+        # never reveal anything about other users' installations.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Installation not found",
+        )
     return JSONResponse(
         content={
             "connected_installation_id": installation_id,
@@ -119,6 +133,7 @@ async def connect_installation(
 async def disconnect_installation(
     user: dict = Depends(get_current_user),
     _csrf: None = Depends(verify_csrf),
+    store: Store = Depends(get_store),
 ) -> JSONResponse:
     """Clear the user's connected installation.
 
@@ -126,5 +141,5 @@ async def disconnect_installation(
     freely.
     """
 
-    set_connected_installation(user["id"], None)
+    await store.set_connected_installation(user["id"], None)
     return JSONResponse(content={"connected_installation_id": None})
