@@ -390,11 +390,13 @@ async def index_symbols(
             if not source_id:
                 continue
 
+            raw_target = getattr(edge, "raw_target", "") or edge.target_name
             target_id = _resolve_target(
                 edge.source_qualified_name,
                 edge.target_name,
                 parse_result.imported_names,
                 repo_symbols,
+                raw_target=raw_target,
             )
 
             stmt = (
@@ -430,11 +432,14 @@ def _resolve_target(
     target_name: str,
     imported_names: dict[str, str],
     repo_symbols: dict[str, int],
+    raw_target: str = "",
 ) -> int | None:
     """Resolve target symbol id using the 5-step resolution rules."""
+    lookup_target = raw_target or target_name
+
     # 1. Same-class self.method
-    if target_name.startswith("self."):
-        method_name = target_name[len("self."):]
+    if lookup_target.startswith("self."):
+        method_name = lookup_target[len("self."):]
         parts = source_qname.split(".")
         if len(parts) >= 2:
             class_qname = ".".join(parts[:-1])
@@ -444,48 +449,73 @@ def _resolve_target(
 
     # 2. Same-module names
     module_parts = source_qname.split(".")
-    # If source is a method (module.Class.method), module is module_parts[:-2]
-    # If source is function/class (module.func), module is module_parts[:-1]
     if len(module_parts) > 1:
-        # Try parent scopes
         for i in range(len(module_parts) - 1, 0, -1):
             parent_scope = ".".join(module_parts[:i])
-            candidate = f"{parent_scope}.{target_name}"
+            candidate = f"{parent_scope}.{lookup_target}"
             if candidate in repo_symbols:
                 return repo_symbols[candidate]
+            candidate_short = f"{parent_scope}.{target_name}"
+            if candidate_short in repo_symbols:
+                return repo_symbols[candidate_short]
 
     # 3. Imported names resolved to repo_files paths
+    if lookup_target in imported_names:
+        imported_target = imported_names[lookup_target]
+        if imported_target in repo_symbols:
+            return repo_symbols[imported_target]
     if target_name in imported_names:
         imported_target = imported_names[target_name]
         if imported_target in repo_symbols:
             return repo_symbols[imported_target]
-        # Also check if imported target matches a class and call is method: e.g. alias.method
+
     for alias, full_import in imported_names.items():
-        if target_name.startswith(f"{alias}."):
-            remainder = target_name[len(f"{alias}."):]
+        if lookup_target.startswith(f"{alias}."):
+            remainder = lookup_target[len(f"{alias}."):]
             candidate = f"{full_import}.{remainder}"
             if candidate in repo_symbols:
                 return repo_symbols[candidate]
 
     # 4. Direct exact qualified_name match
+    if lookup_target in repo_symbols:
+        return repo_symbols[lookup_target]
     if target_name in repo_symbols:
         return repo_symbols[target_name]
 
-    # 5. Unique name match in repo symbols
-    short_target = target_name.split(".")[-1]
-    matches = [
-        sym_id
-        for qname, sym_id in repo_symbols.items()
-        if qname.endswith(f".{short_target}") or qname == short_target
-    ]
-    if len(matches) == 1:
-        return matches[0]
+    # 5. Unique name match in repo symbols (ONLY for bare calls, not unknown object attributes)
+    if "." not in lookup_target:
+        short_target = target_name
+        matches = [
+            sym_id
+            for qname, sym_id in repo_symbols.items()
+            if qname.endswith(f".{short_target}") or qname == short_target
+        ]
+        if len(matches) == 1:
+            return matches[0]
 
     return None
 
 
 async def _resolve_unresolved_edges(session: AsyncSession, repo_id: int) -> None:
-    """Repo-wide pass that resolves symbol_edges where target_symbol_id IS NULL."""
+    """Repo-wide pass that resolves symbol_edges where target_symbol_id IS NULL,
+    and nullifies edges pointing to deleted symbols."""
+    # First: Nullify target_symbol_id for edges pointing to soft-deleted or non-existent symbols
+    await session.execute(
+        update(SymbolEdge)
+        .where(
+            SymbolEdge.repo_id == repo_id,
+            SymbolEdge.target_symbol_id.is_not(None),
+            SymbolEdge.target_symbol_id.in_(
+                select(CodeSymbol.id).where(
+                    CodeSymbol.repo_id == repo_id,
+                    CodeSymbol.deleted_at.is_not(None),
+                )
+            ),
+        )
+        .values(target_symbol_id=None)
+    )
+
+    # Preload active symbols
     symbols_res = await session.execute(
         select(CodeSymbol.id, CodeSymbol.name, CodeSymbol.qualified_name).where(
             CodeSymbol.repo_id == repo_id, CodeSymbol.deleted_at.is_(None)
@@ -493,13 +523,13 @@ async def _resolve_unresolved_edges(session: AsyncSession, repo_id: int) -> None
     )
     repo_symbols = {row.qualified_name: row.id for row in symbols_res}
 
-    # Group by short name for unique resolution
+    # Group by name for unique resolution
     name_to_ids = defaultdict(list)
     for qname, sym_id in repo_symbols.items():
         name = qname.split(".")[-1]
         name_to_ids[name].append(sym_id)
 
-    unresolved_query = select(SymbolEdge.id, SymbolEdge.target_name).where(
+    unresolved_query = select(SymbolEdge.id, SymbolEdge.target_name, SymbolEdge.relation).where(
         SymbolEdge.repo_id == repo_id, SymbolEdge.target_symbol_id.is_(None)
     )
     unresolved_edges = (await session.execute(unresolved_query)).all()
@@ -507,9 +537,8 @@ async def _resolve_unresolved_edges(session: AsyncSession, repo_id: int) -> None
     for edge in unresolved_edges:
         target_name = edge.target_name
         resolved_id = repo_symbols.get(target_name)
-        if not resolved_id:
-            short_name = target_name.split(".")[-1]
-            candidates = name_to_ids.get(short_name, [])
+        if not resolved_id and edge.relation in ("imports", "inherits"):
+            candidates = name_to_ids.get(target_name, [])
             if len(candidates) == 1:
                 resolved_id = candidates[0]
 

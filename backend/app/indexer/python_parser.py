@@ -29,6 +29,7 @@ class ParsedEdge:
     target_name: str
     relation: str  # 'calls' | 'imports' | 'inherits' | 'tests'
     call_line: int
+    raw_target: str = ""
 
 
 @dataclass
@@ -74,6 +75,7 @@ class SymbolExtractor(ast.NodeVisitor):
         self.symbols: list[ParsedSymbol] = []
         self.edges: list[ParsedEdge] = []
         self.imported_names: dict[str, str] = {}
+        self.local_types: dict[str, str] = {}
 
         # Stack tracking current scopes: list of (scope_name, kind, qualified_name)
         self._scope_stack: list[tuple[str, str, str]] = []
@@ -131,15 +133,17 @@ class SymbolExtractor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            target = alias.name
+            raw_target = alias.name
+            target_name = raw_target.split(".")[-1]
             asname = alias.asname or alias.name
-            self.imported_names[asname] = target
+            self.imported_names[asname] = raw_target
             self.edges.append(
                 ParsedEdge(
                     source_qualified_name=self.module_path,
-                    target_name=target,
+                    target_name=target_name,
                     relation="imports",
                     call_line=node.lineno,
+                    raw_target=raw_target,
                 )
             )
         self.generic_visit(node)
@@ -147,7 +151,6 @@ class SymbolExtractor(ast.NodeVisitor):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
         if node.level > 0:
-            # Relative import
             parts = self.module_path.split(".")
             base_parts = parts[:-node.level] if len(parts) >= node.level else []
             if module:
@@ -159,19 +162,33 @@ class SymbolExtractor(ast.NodeVisitor):
 
         for alias in node.names:
             if resolved_mod:
-                target = f"{resolved_mod}.{alias.name}"
+                raw_target = f"{resolved_mod}.{alias.name}"
             else:
-                target = alias.name
+                raw_target = alias.name
             asname = alias.asname or alias.name
-            self.imported_names[asname] = target
+            self.imported_names[asname] = raw_target
+            target_name = alias.name.split(".")[-1]
             self.edges.append(
                 ParsedEdge(
                     source_qualified_name=self.module_path,
-                    target_name=target,
+                    target_name=target_name,
                     relation="imports",
                     call_line=node.lineno,
+                    raw_target=raw_target,
                 )
             )
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if isinstance(node.value, ast.Call):
+            try:
+                func_repr = ast.unparse(node.value.func)
+                resolved_cls = self.imported_names.get(func_repr, func_repr)
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.local_types[target.id] = resolved_cls
+            except Exception:
+                pass
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -201,13 +218,15 @@ class SymbolExtractor(ast.NodeVisitor):
 
         # Inherits edges
         for base in node.bases:
-            target_name = ast.unparse(base)
+            raw_base = ast.unparse(base)
+            target_name = raw_base.split(".")[-1]
             self.edges.append(
                 ParsedEdge(
                     source_qualified_name=class_qname,
                     target_name=target_name,
                     relation="inherits",
                     call_line=node.lineno,
+                    raw_target=raw_base,
                 )
             )
 
@@ -257,15 +276,29 @@ class SymbolExtractor(ast.NodeVisitor):
             source_qname = self._scope_stack[-1][2]
             source_name = self._scope_stack[-1][0]
 
+            raw_target = ""
+            target_name = ""
             try:
                 if isinstance(node.func, ast.Name):
                     target_name = node.func.id
+                    raw_target = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    target_name = node.func.attr
+                    raw_target = ast.unparse(node.func)
+                    if isinstance(node.func.value, ast.Name):
+                        var_name = node.func.value.id
+                        if var_name in self.local_types:
+                            cls_name = self.local_types[var_name]
+                            raw_target = f"{cls_name}.{node.func.attr}"
                 else:
-                    target_name = ast.unparse(node.func)
+                    raw_target = ast.unparse(node.func)
+                    target_name = raw_target.split(".")[-1]
             except Exception:
                 target_name = "unknown"
+                raw_target = "unknown"
 
-            # Determine relation: if inside a test function or test file
+            target_name = target_name.split(".")[-1]
+
             is_test = (
                 self.is_test_file
                 or source_name.startswith("test_")
@@ -279,6 +312,7 @@ class SymbolExtractor(ast.NodeVisitor):
                     target_name=target_name,
                     relation=relation,
                     call_line=getattr(node, "lineno", 1),
+                    raw_target=raw_target,
                 )
             )
 

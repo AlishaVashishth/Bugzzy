@@ -10,7 +10,8 @@ import asyncio
 import sys
 from sqlalchemy import select, text
 
-from app.db.engine import get_sessionmaker
+from app.config import get_settings
+from app.db.engine import database_host, get_sessionmaker
 from app.db.models import Repository, UserInstallation
 from app.indexer.repo_indexer import index_repo
 from app.services import github_app
@@ -20,6 +21,14 @@ async def main(repo_slug: str) -> None:
     if "/" not in repo_slug:
         print(f"Error: expected format 'owner/name', got '{repo_slug}'")
         sys.exit(1)
+
+    url = get_settings().test_database_url
+    if not url:
+        print("Error: TEST_DATABASE_URL is not configured.")
+        sys.exit(1)
+
+    host = database_host(url)
+    print(f"Connecting to database host: {host}")
 
     owner, name = repo_slug.split("/", 1)
     maker = get_sessionmaker()

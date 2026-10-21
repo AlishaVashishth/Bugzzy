@@ -14,18 +14,12 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("users", sa.Column("name", sa.Text(), nullable=True))
-    op.add_column(
-        "users",
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.func.now(),
-            nullable=False,
-        ),
+    op.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT;")
+    op.execute(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at "
+        "TIMESTAMPTZ NOT NULL DEFAULT now();"
     )
 
 
 def downgrade() -> None:
-    op.drop_column("users", "updated_at")
-    op.drop_column("users", "name")
+    pass

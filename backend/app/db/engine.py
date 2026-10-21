@@ -126,24 +126,25 @@ _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
+
 def get_engine() -> AsyncEngine:
-    """Create (once) and return the app-wide engine."""
+    """Create (once) and return the app-wide engine targeting DATABASE_URL."""
 
     global _engine, _sessionmaker
 
     if _engine is None:
         url = get_settings().database_url
         if not url:
-            # Should be impossible in production (config fails fast), but
-            # keep the error clear and free of secrets.
             raise RuntimeError("DATABASE_URL is not configured.")
 
         _engine = create_async_engine(
-            normalize_database_url(url), **_engine_kwargs(url, use_null_pool=False)
+            normalize_database_url(url),
+            **_engine_kwargs(url, use_null_pool=False),
         )
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
 
     return _engine
+
 
 
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
