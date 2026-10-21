@@ -15,8 +15,8 @@ import hmac
 from fastapi import Depends, HTTPException, Request, status
 
 from app.config import get_settings
-from app.security.sessions import Session, get_session_store
-from app.services.user_store import get_user_by_id
+from app.security.sessions import Session
+from app.services.store import Store, get_store
 
 # The same 401 body is used everywhere, so we never hint at whether a
 # session, a user, or a cookie was the problem.
@@ -37,14 +37,16 @@ def get_raw_session_id(request: Request) -> str | None:
     return request.cookies.get(settings.session_cookie_name)
 
 
-def _load_session_or_401(request: Request) -> tuple[str, Session]:
+async def _load_session_or_401(
+    request: Request, store: Store
+) -> tuple[str, Session]:
     """Look up the current session, or raise 401.
 
     Returns the raw id (so callers can delete the session) and the Session.
     """
 
     raw_session_id = get_raw_session_id(request)
-    session = get_session_store().get(raw_session_id)
+    session = await store.get_session(raw_session_id)
     if session is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=_NOT_AUTHENTICATED
@@ -52,27 +54,30 @@ def _load_session_or_401(request: Request) -> tuple[str, Session]:
     return raw_session_id or "", session
 
 
-async def get_current_session(request: Request) -> Session:
+async def get_current_session(
+    request: Request, store: Store = Depends(get_store)
+) -> Session:
     """Return the session for this request, or raise 401."""
 
-    _, session = _load_session_or_401(request)
+    _, session = await _load_session_or_401(request, store)
     return session
 
 
-async def get_current_user(request: Request) -> dict:
+async def get_current_user(
+    request: Request, store: Store = Depends(get_store)
+) -> dict:
     """Return the logged-in user, or raise 401.
 
-    If the session is valid but its user no longer exists (for example the
-    temporary user store was wiped by a restart), we delete the stale
-    session and treat the request as unauthenticated.
+    If the session is valid but its user no longer exists, we delete the
+    stale session and treat the request as unauthenticated.
     """
 
-    raw_session_id, session = _load_session_or_401(request)
+    raw_session_id, session = await _load_session_or_401(request, store)
 
-    user = get_user_by_id(session.user_id)
+    user = await store.get_user_by_id(session.user_id)
     if user is None:
         # Remove the dangling session so it cannot linger.
-        get_session_store().delete(raw_session_id)
+        await store.delete_session(raw_session_id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=_NOT_AUTHENTICATED
         )

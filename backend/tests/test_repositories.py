@@ -26,6 +26,7 @@ from app.services.github_app import (
     GitHubAuthError,
     InstallationUnavailableError,
 )
+from app.services.store import get_store
 
 FAKE_INSTALLATION_TOKEN = "ghs_FAKE_INSTALLATION_TOKEN_MUST_NOT_LEAK"
 
@@ -482,7 +483,7 @@ def test_repositories_installation_unavailable_clears(
 ) -> None:
     _login_and_connect(client, monkeypatch, 111)
     user_id = _user_id(client)
-    user_store.set_selected_repositories(user_id, 111, [1001])
+    asyncio.run(get_store().set_selected_repositories(user_id, 111, [1001]))
 
     # A 404 from the token endpoint means the installation is gone.
     gh.handler = lambda *args: (404, {"message": "Not Found"}, {})
@@ -492,8 +493,10 @@ def test_repositories_installation_unavailable_clears(
     assert resp.json()["detail"] == "Installation is no longer available. Please reconnect."
 
     # Connection and selections are cleared.
-    assert user_store.get_connected_installation(user_id) is None
-    assert user_store.get_selected_repositories(user_id, 111) == []
+    assert asyncio.run(get_store().get_connected_installation(user_id)) is None
+    assert (
+        asyncio.run(get_store().get_selected_repositories(user_id, 111)) == []
+    )
 
 
 def test_repositories_rate_limit_returns_502(
@@ -570,7 +573,9 @@ def test_select_unavailable_id_returns_422_and_stores_nothing(
     )
     assert resp.status_code == 422
     assert resp.json()["detail"] == "One or more repositories are not accessible"
-    assert user_store.get_selected_repositories(user_id, 111) == []
+    assert (
+        asyncio.run(get_store().get_selected_repositories(user_id, 111)) == []
+    )
 
 
 def test_select_non_integer_ids_returns_422(
@@ -631,8 +636,10 @@ def test_selections_isolated_between_users(
         headers={"X-CSRF-Token": csrf2},
     )
 
-    assert user_store.get_selected_repositories(user1, 111) == [1001]
-    assert user_store.get_selected_repositories(user2, 222) == []
+    assert (
+        asyncio.run(get_store().get_selected_repositories(user1, 111)) == [1001]
+    )
+    assert asyncio.run(get_store().get_selected_repositories(user2, 222)) == []
 
     body = other.get("/api/v1/repositories").json()
     assert all(r["selected"] is False for r in body["repositories"])
@@ -648,10 +655,15 @@ def test_disconnect_clears_selections(
         json={"repository_ids": [1001]},
         headers={"X-CSRF-Token": csrf},
     )
-    assert user_store.get_selected_repositories(user_id, 111) == [1001]
+    assert (
+        asyncio.run(get_store().get_selected_repositories(user_id, 111))
+        == [1001]
+    )
 
     client.post("/api/v1/installations/disconnect", headers={"X-CSRF-Token": csrf})
-    assert user_store.get_selected_repositories(user_id, 111) == []
+    assert (
+        asyncio.run(get_store().get_selected_repositories(user_id, 111)) == []
+    )
 
 
 def test_changing_installation_clears_selections(
@@ -671,12 +683,17 @@ def test_changing_installation_clears_selections(
         json={"repository_ids": [1001]},
         headers={"X-CSRF-Token": csrf},
     )
-    assert user_store.get_selected_repositories(user_id, 111) == [1001]
+    assert (
+        asyncio.run(get_store().get_selected_repositories(user_id, 111))
+        == [1001]
+    )
 
     # Switch to the other installation: selections for 111 are cleared.
     client.post("/api/v1/installations/222/connect", headers={"X-CSRF-Token": csrf})
-    assert user_store.get_selected_repositories(user_id, 111) == []
-    assert user_store.get_connected_installation(user_id) == 222
+    assert (
+        asyncio.run(get_store().get_selected_repositories(user_id, 111)) == []
+    )
+    assert asyncio.run(get_store().get_connected_installation(user_id)) == 222
 
 
 # --------------------------------------------------------------------------

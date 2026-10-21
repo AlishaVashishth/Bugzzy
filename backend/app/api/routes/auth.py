@@ -28,7 +28,6 @@ from app.api.deps import (
     verify_csrf,
 )
 from app.config import get_settings
-from app.security.sessions import get_session_store
 from app.security.state import (
     code_challenge_s256,
     create_code_verifier,
@@ -41,7 +40,7 @@ from app.services.github_app import (
     GitHubAuthError,
     GitHubNetworkError,
 )
-from app.services.user_store import set_user_installations, upsert_user
+from app.services.store import Store, get_store
 
 # A logger for this module. We only ever log safe, fixed messages: never a
 # token, a code, or a session id.
@@ -161,6 +160,7 @@ async def github_callback(
     error: str | None = Query(default=None),
     setup_action: str | None = Query(default=None),
     installation_id: str | None = Query(default=None),
+    store: Store = Depends(get_store),
 ) -> Response:
     """Finish login: validate, exchange the code, then start a session.
 
@@ -266,18 +266,21 @@ async def github_callback(
     # local variable above and is dropped as soon as this request ends.
 
     # 7. Save the user locally and replace their installation list.
-    user = upsert_user(github_user)
-    set_user_installations(user["id"], installations)
+    user = await store.upsert_user(github_user)
+    await store.set_user_installations(user["id"], installations)
+
+    # 7b. Cheap cleanup of expired sessions. The sessions table has an index
+    #     on expires_at, so this is fast. Once per login is plenty.
+    await store.purge_expired_sessions()
 
     # 8. If this browser already has a session, remove it first. Every login
     #    gets a brand new session id; we never reuse an old one.
-    store = get_session_store()
     existing_raw_id = get_raw_session_id(request)
     if existing_raw_id:
-        store.delete(existing_raw_id)
+        await store.delete_session(existing_raw_id)
 
     # 9. Create the new session and send the browser to the frontend.
-    raw_session_id, _csrf_token = store.create(user["id"])
+    raw_session_id, _csrf_token = await store.create_session(user["id"])
 
     response = RedirectResponse(url=get_settings().frontend_url, status_code=302)
     _set_session_cookie(response, raw_session_id)
@@ -326,6 +329,7 @@ async def logout(
     request: Request,
     _user: dict = Depends(get_current_user),
     _csrf: None = Depends(verify_csrf),
+    store: Store = Depends(get_store),
 ) -> JSONResponse:
     """End the current session.
 
@@ -334,7 +338,7 @@ async def logout(
     """
 
     # Remove the session from the store.
-    get_session_store().delete(get_raw_session_id(request))
+    await store.delete_session(get_raw_session_id(request))
 
     response = JSONResponse(content={"message": "Logged out"})
     _clear_session_cookie(response)

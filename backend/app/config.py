@@ -77,6 +77,13 @@ class Settings:
     session_max_age_seconds: int
     session_idle_timeout_seconds: int
 
+    # --- Step 6 additions (optional in development) ---
+    # The main database. When this is missing we fall back to the
+    # in-memory stores (except in production, where it is required).
+    database_url: str | None
+    # A separate database used only by the database integration tests.
+    test_database_url: str | None
+
     @property
     def frontend_origin(self) -> str:
         """Just the scheme + host of the frontend URL, e.g. http://localhost:5173.
@@ -141,6 +148,18 @@ def _optional(name: str, default: str) -> str:
     return value.strip()
 
 
+def _optional_url(name: str) -> str | None:
+    """Return an optional URL-like variable, or None when unset/blank.
+
+    We never print this value: it can contain a database password.
+    """
+
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return value.strip()
+
+
 def _optional_int(name: str, default: int) -> int:
     """Return an integer environment variable, or the default.
 
@@ -193,6 +212,19 @@ def get_settings() -> Settings:
             "Check GITHUB_PRIVATE_KEY_PATH."
         )
 
+    app_env = _optional("APP_ENV", DEFAULT_APP_ENV)
+    database_url = _optional_url("DATABASE_URL")
+    test_database_url = _optional_url("TEST_DATABASE_URL")
+
+    # In production there is no safe in-memory fallback: data would vanish
+    # on every restart. Fail fast and name the missing variable (never its
+    # value).
+    if app_env == "production" and not database_url:
+        raise RuntimeError(
+            "Missing required environment variable: DATABASE_URL "
+            "(required when APP_ENV=production)."
+        )
+
     return Settings(
         app_id=app_id,
         client_id=raw_values["GITHUB_CLIENT_ID"],
@@ -202,7 +234,7 @@ def get_settings() -> Settings:
         # Optional values fall back to sensible local-development defaults.
         redirect_uri=_optional("GITHUB_REDIRECT_URI", DEFAULT_REDIRECT_URI),
         frontend_url=_optional("FRONTEND_URL", DEFAULT_FRONTEND_URL),
-        app_env=_optional("APP_ENV", DEFAULT_APP_ENV),
+        app_env=app_env,
         session_cookie_name=_optional(
             "SESSION_COOKIE_NAME", DEFAULT_SESSION_COOKIE_NAME
         ),
@@ -212,4 +244,6 @@ def get_settings() -> Settings:
         session_idle_timeout_seconds=_optional_int(
             "SESSION_IDLE_TIMEOUT_SECONDS", DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS
         ),
+        database_url=database_url,
+        test_database_url=test_database_url,
     )
