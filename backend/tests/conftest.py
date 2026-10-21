@@ -10,7 +10,12 @@ their own store, and they only run when TEST_DATABASE_URL is set.
 
 from __future__ import annotations
 
+import asyncio
+import sys
 import pytest
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from app.services.store import InMemoryStore, set_store
 

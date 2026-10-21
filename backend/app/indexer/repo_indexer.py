@@ -1,232 +1,583 @@
+"""Repository code indexer.
+
+Synchronizes GitHub repository trees into `repo_files`, and extracts symbols
+and dependency edges into `code_symbols` and `symbol_edges`.
+
+Importable with zero environment variables set (reads settings lazily).
+Uses SQLAlchemy async sessions and existing database engine.
 """
-repo_indexer.py
 
-Runs after a user connects the GitHub App. It:
-  1. gets a short-lived installation token,
-  2. lists the repos the installation can access and upserts them into `repositories`,
-  3. fetches each repo's full file tree (ONE API call per repo),
-  4. upserts folders/files into `repo_files` (only changed rows are touched),
-  5. tombstones files that no longer exist (deleted_at), never physically deletes,
-  6. hands changed .py files to the symbol indexer (Tree-sitter, Person 1).
+from __future__ import annotations
 
-Install:  pip install httpx "psycopg[binary]" pyjwt cryptography
-Env vars: DATABASE_URL, GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY (PEM text)
-
-Call `index_user_installation(installation_id)` from a BACKGROUND task
-(FastAPI BackgroundTasks first, Celery/RQ later). Never inside the login request.
-"""
-import os
+import base64
+import logging
 import posixpath
-import time
+from collections import defaultdict
+from typing import Any
 
 import httpx
-import jwt
-import psycopg
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.engine import get_sessionmaker
+from app.db.models import CodeSymbol, RepoFile, Repository, SelectedRepository, SymbolEdge
+from app.indexer.python_parser import ParseResult, parse_python_source
+from app.services import github_app
+
+logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
-APP_ID = os.environ["GITHUB_APP_ID"]
-PRIVATE_KEY = os.environ["GITHUB_APP_PRIVATE_KEY"]
-DATABASE_URL = os.environ["DATABASE_URL"]
+MAX_FILE_SIZE_BYTES = 1024 * 1024  # 1 MB
 
-SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", ".idea"}
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "venv",
+    ".venv",
+    "__pycache__",
+    "dist",
+    "build",
+    ".idea",
+    ".vscode",
+}
 
 LANGUAGES = {
-    ".py": "python", ".js": "javascript", ".ts": "typescript", ".tsx": "typescript",
-    ".jsx": "javascript", ".html": "html", ".css": "css", ".json": "json",
-    ".md": "markdown", ".txt": "text", ".yml": "yaml", ".yaml": "yaml",
-    ".java": "java", ".go": "go", ".rs": "rust", ".sql": "sql",
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".jsx": "javascript",
+    ".html": "html",
+    ".css": "css",
+    ".json": "json",
+    ".md": "markdown",
+    ".txt": "text",
+    ".yml": "yaml",
+    ".yaml": "yaml",
+    ".java": "java",
+    ".go": "go",
+    ".rs": "rust",
+    ".sql": "sql",
 }
 
 
-# ---------------------------------------------------------------- GitHub auth
-def _app_jwt() -> str:
-    now = int(time.time())
-    payload = {"iat": now - 60, "exp": now + 9 * 60, "iss": APP_ID}
-    return jwt.encode(payload, PRIVATE_KEY, algorithm="RS256")
-
-
-def get_installation_token(installation_id: int) -> str:
-    r = httpx.post(
-        f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
-        headers={"Authorization": f"Bearer {_app_jwt()}", "Accept": "application/vnd.github+json"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()["token"]
-
-
-def _gh(token: str) -> httpx.Client:
-    return httpx.Client(
-        base_url=GITHUB_API,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-        timeout=60,
-    )
-
-
-# ---------------------------------------------------------------- Step 1: repos
-def sync_installation_repos(conn, token: str, installation_id: int) -> list[int]:
-    """Upsert every repo the installation can access. Returns local repositories.id values."""
-    local_ids, page = [], 1
-    with _gh(token) as gh:
-        while True:
-            r = gh.get("/installation/repositories", params={"per_page": 100, "page": page})
-            r.raise_for_status()
-            repos = r.json()["repositories"]
-            if not repos:
-                break
-            for repo in repos:
-                row = conn.execute(
-                    """
-                    INSERT INTO repositories (github_repo_id, owner, name, default_branch, installation_id)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (github_repo_id) DO UPDATE
-                      SET owner = EXCLUDED.owner, name = EXCLUDED.name,
-                          default_branch = EXCLUDED.default_branch,
-                          installation_id = EXCLUDED.installation_id
-                    RETURNING id
-                    """,
-                    (repo["id"], repo["owner"]["login"], repo["name"],
-                     repo["default_branch"], installation_id),
-                ).fetchone()
-                local_ids.append(row[0])
-            page += 1
-    return local_ids
-
-
-# ---------------------------------------------------------------- Step 2: file tree
-def fetch_tree(token: str, owner: str, name: str, branch: str):
-    """Returns (commit_sha, tree_entries) using a single recursive tree call."""
-    with _gh(token) as gh:
-        c = gh.get(f"/repos/{owner}/{name}/commits/{branch}")
-        c.raise_for_status()
-        commit_sha = c.json()["sha"]
-        tree_sha = c.json()["commit"]["tree"]["sha"]
-
-        t = gh.get(f"/repos/{owner}/{name}/git/trees/{tree_sha}", params={"recursive": "1"})
-        t.raise_for_status()
-        data = t.json()
-        if data.get("truncated"):
-            # Very large repo: GitHub cut the list. Fallback = walk folder by folder
-            # (non-recursive) instead. Not needed for student-scale projects.
-            print(f"WARNING: tree truncated for {owner}/{name}")
-        return commit_sha, data["tree"]
-
-
-def _skip(path: str) -> bool:
+def _skip_path(path: str) -> bool:
     return any(part in SKIP_DIRS for part in path.split("/"))
 
 
-def _to_row(repo_id: int, entry: dict, commit_sha: str):
+def _to_file_row(repo_id: int, entry: dict, commit_sha: str) -> dict[str, Any]:
     path = entry["path"]
     ext = posixpath.splitext(path)[1].lower()
     is_dir = entry["type"] == "tree"
-    return (
-        repo_id,
-        path,
-        posixpath.dirname(path),            # '' for root-level items
-        posixpath.basename(path),
-        "dir" if is_dir else "file",
-        None if is_dir else LANGUAGES.get(ext),
-        entry.get("size"),                  # None for dirs
-        entry["sha"],                       # blob SHA (file) or tree SHA (dir)
-        commit_sha,
+    return {
+        "repo_id": repo_id,
+        "path": path,
+        "parent_path": posixpath.dirname(path),
+        "name": posixpath.basename(path),
+        "node_type": "dir" if is_dir else "file",
+        "language": None if is_dir else LANGUAGES.get(ext),
+        "size_bytes": entry.get("size"),
+        "content_hash": entry["sha"],
+        "indexed_sha": commit_sha,
+    }
+
+
+async def sync_installation_repos(
+    session: AsyncSession, token: str, installation_id: int
+) -> list[dict[str, Any]]:
+    """Fetch repos accessible by the installation and upsert into repositories table."""
+    upserted_repos: list[dict[str, Any]] = []
+    page = 1
+
+    async with httpx.AsyncClient(
+        base_url=GITHUB_API,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        timeout=60.0,
+    ) as gh:
+        while True:
+            resp = await gh.get(
+                "/installation/repositories", params={"per_page": 100, "page": page}
+            )
+            resp.raise_for_status()
+            repos = resp.json().get("repositories", [])
+            if not repos:
+                break
+
+            for repo_data in repos:
+                github_repo_id = repo_data["id"]
+                owner = repo_data["owner"]["login"]
+                name = repo_data["name"]
+                default_branch = repo_data.get("default_branch") or "main"
+
+                stmt = (
+                    pg_insert(Repository)
+                    .values(
+                        github_repo_id=github_repo_id,
+                        owner=owner,
+                        name=name,
+                        default_branch=default_branch,
+                        installation_id=installation_id,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[Repository.github_repo_id],
+                        set_={
+                            "owner": owner,
+                            "name": name,
+                            "default_branch": default_branch,
+                            "installation_id": installation_id,
+                        },
+                    )
+                    .returning(Repository.id, Repository.github_repo_id, Repository.owner, Repository.name, Repository.default_branch)
+                )
+                res = await session.execute(stmt)
+                row = res.one()
+                upserted_repos.append(
+                    {
+                        "id": row.id,
+                        "github_repo_id": row.github_repo_id,
+                        "owner": row.owner,
+                        "name": row.name,
+                        "default_branch": row.default_branch,
+                    }
+                )
+
+            page += 1
+
+    await session.commit()
+    return upserted_repos
+
+
+async def fetch_tree(
+    gh: httpx.AsyncClient, owner: str, name: str, branch: str
+) -> tuple[str, list[dict]]:
+    """Fetch repository git tree via recursive tree endpoint."""
+    c = await gh.get(f"/repos/{owner}/{name}/commits/{branch}")
+    c.raise_for_status()
+    commit_sha = c.json()["sha"]
+    tree_sha = c.json()["commit"]["tree"]["sha"]
+
+    t = await gh.get(f"/repos/{owner}/{name}/git/trees/{tree_sha}", params={"recursive": "1"})
+    t.raise_for_status()
+    data = t.json()
+    if data.get("truncated"):
+        logger.warning("Tree truncated by GitHub for %s/%s", owner, name)
+    return commit_sha, data.get("tree", [])
+
+
+async def index_repo(session: AsyncSession, token: str, repo_id: int) -> None:
+    """Index one repository's file tree and code symbols."""
+    repo = (
+        await session.execute(select(Repository).where(Repository.id == repo_id))
+    ).scalar_one_or_none()
+    if not repo:
+        raise ValueError(f"Repository with id {repo_id} not found")
+
+    owner, name, branch = repo.owner, repo.name, repo.default_branch
+
+    async with httpx.AsyncClient(
+        base_url=GITHUB_API,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        timeout=60.0,
+    ) as gh:
+        commit_sha, tree = await fetch_tree(gh, owner, name, branch)
+
+        entries = [
+            e for e in tree if e.get("type") in ("blob", "tree") and not _skip_path(e.get("path", ""))
+        ]
+        file_rows = [_to_file_row(repo_id, e, commit_sha) for e in entries]
+        live_paths = [r["path"] for r in file_rows]
+
+        # 1. Upsert files into repo_files
+        for r in file_rows:
+            stmt = (
+                pg_insert(RepoFile)
+                .values(
+                    repo_id=r["repo_id"],
+                    path=r["path"],
+                    parent_path=r["parent_path"],
+                    name=r["name"],
+                    node_type=r["node_type"],
+                    language=r["language"],
+                    size_bytes=r["size_bytes"],
+                    content_hash=r["content_hash"],
+                    indexed_sha=r["indexed_sha"],
+                )
+                .on_conflict_do_update(
+                    index_elements=[RepoFile.repo_id, RepoFile.path],
+                    set_={
+                        "parent_path": r["parent_path"],
+                        "name": r["name"],
+                        "node_type": r["node_type"],
+                        "language": r["language"],
+                        "size_bytes": r["size_bytes"],
+                        "content_hash": r["content_hash"],
+                        "indexed_sha": r["indexed_sha"],
+                        "deleted_at": None,
+                        "updated_at": func.now(),
+                    },
+                    where=(
+                        (RepoFile.content_hash.is_distinct_from(r["content_hash"]))
+                        | (RepoFile.deleted_at.is_not(None))
+                    ),
+                )
+            )
+            await session.execute(stmt)
+
+        # 2. Tombstone disappeared files
+        if live_paths:
+            await session.execute(
+                update(RepoFile)
+                .where(
+                    RepoFile.repo_id == repo_id,
+                    RepoFile.deleted_at.is_(None),
+                    ~RepoFile.path.in_(live_paths),
+                )
+                .values(deleted_at=func.now(), updated_at=func.now())
+            )
+
+        # 3. Update last_indexed_sha
+        await session.execute(
+            update(Repository)
+            .where(Repository.id == repo_id)
+            .values(last_indexed_sha=commit_sha)
+        )
+        await session.commit()
+
+        # 4. Index symbols for Python files
+        await index_symbols(session, gh, repo_id, commit_sha)
+
+
+async def _fetch_blob_content(gh: httpx.AsyncClient, owner: str, name: str, blob_sha: str) -> str:
+    res = await gh.get(f"/repos/{owner}/{name}/git/blobs/{blob_sha}")
+    res.raise_for_status()
+    data = res.json()
+    encoding = data.get("encoding", "base64")
+    raw_content = data.get("content", "")
+    if encoding == "base64":
+        return base64.b64decode(raw_content).decode("utf-8", errors="replace")
+    return raw_content
+
+
+async def index_symbols(
+    session: AsyncSession, gh: httpx.AsyncClient, repo_id: int, commit_sha: str
+) -> None:
+    """Index functions, classes, and call relationships for changed Python files."""
+    repo = (
+        await session.execute(select(Repository).where(Repository.id == repo_id))
+    ).scalar_one()
+    owner, name = repo.owner, repo.name
+
+    # Identify .py files that are new or changed this run, or have 0 symbols
+    files_query = text("""
+        SELECT f.id, f.path, f.content_hash, f.size_bytes
+        FROM repo_files f
+        LEFT JOIN code_symbols s ON s.file_id = f.id AND s.deleted_at IS NULL
+        WHERE f.repo_id = :repo_id
+          AND f.language = 'python'
+          AND f.node_type = 'file'
+          AND f.deleted_at IS NULL
+          AND (f.size_bytes IS NULL OR f.size_bytes <= :max_size)
+          AND (f.indexed_sha = :commit_sha OR s.id IS NULL)
+        GROUP BY f.id, f.path, f.content_hash, f.size_bytes;
+    """)
+
+    res = await session.execute(
+        files_query, {"repo_id": repo_id, "commit_sha": commit_sha, "max_size": MAX_FILE_SIZE_BYTES}
     )
+    changed_files = [dict(row._mapping) for row in res]
+    if not changed_files:
+        return
 
+    # Preload existing active repo symbols for edge resolution
+    existing_symbols_res = await session.execute(
+        select(CodeSymbol.id, CodeSymbol.name, CodeSymbol.qualified_name).where(
+            CodeSymbol.repo_id == repo_id, CodeSymbol.deleted_at.is_(None)
+        )
+    )
+    repo_symbols = {row.qualified_name: row.id for row in existing_symbols_res}
 
-# ---------------------------------------------------------------- Step 3: index one repo
-def index_repo(conn, token: str, repo_id: int) -> None:
-    owner, name, branch = conn.execute(
-        "SELECT owner, name, default_branch FROM repositories WHERE id = %s", (repo_id,)
-    ).fetchone()
+    for file_info in changed_files:
+        file_id = file_info["id"]
+        file_path = file_info["path"]
+        content_hash = file_info["content_hash"]
 
-    commit_sha, tree = fetch_tree(token, owner, name, branch)
-    entries = [e for e in tree if e["type"] in ("blob", "tree") and not _skip(e["path"])]
-    rows = [_to_row(repo_id, e, commit_sha) for e in entries]
-    live_paths = [r[1] for r in rows]
+        try:
+            source_code = await _fetch_blob_content(gh, owner, name, content_hash)
+        except Exception as exc:
+            logger.warning("Failed to fetch blob for %s: %s", file_path, exc)
+            continue
 
-    with conn.cursor() as cur:
-        # Upsert. The WHERE clause means unchanged rows are NOT rewritten.
-        cur.executemany(
-            """
-            INSERT INTO repo_files
-              (repo_id, path, parent_path, name, node_type, language, size_bytes, content_hash, indexed_sha)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (repo_id, path) DO UPDATE
-              SET parent_path  = EXCLUDED.parent_path,
-                  name         = EXCLUDED.name,
-                  node_type    = EXCLUDED.node_type,
-                  language     = EXCLUDED.language,
-                  size_bytes   = EXCLUDED.size_bytes,
-                  content_hash = EXCLUDED.content_hash,
-                  indexed_sha  = EXCLUDED.indexed_sha,
-                  deleted_at   = NULL,
-                  updated_at   = now()
-              WHERE repo_files.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-                 OR repo_files.deleted_at IS NOT NULL
-            """,
-            rows,
+        try:
+            parse_result = parse_python_source(source_code, file_path)
+        except SyntaxError as exc:
+            logger.warning("Syntax error parsing %s: %s", file_path, exc)
+            continue
+        except Exception as exc:
+            logger.error("Unexpected error parsing %s: %s", file_path, exc)
+            continue
+
+        # Upsert symbols for this file
+        current_qnames: list[str] = []
+        file_symbol_ids: dict[str, int] = {}
+
+        for sym in parse_result.symbols:
+            current_qnames.append(sym.qualified_name)
+            stmt = (
+                pg_insert(CodeSymbol)
+                .values(
+                    repo_id=repo_id,
+                    file_id=file_id,
+                    name=sym.name,
+                    qualified_name=sym.qualified_name,
+                    kind=sym.kind,
+                    signature=sym.signature,
+                    docstring=sym.docstring,
+                    start_line=sym.start_line,
+                    end_line=sym.end_line,
+                    content_hash=sym.content_hash,
+                    deleted_at=None,
+                )
+                .on_conflict_do_update(
+                    index_elements=[CodeSymbol.file_id, CodeSymbol.qualified_name, CodeSymbol.kind],
+                    set_={
+                        "name": sym.name,
+                        "signature": sym.signature,
+                        "docstring": sym.docstring,
+                        "start_line": sym.start_line,
+                        "end_line": sym.end_line,
+                        "content_hash": sym.content_hash,
+                        "deleted_at": None,
+                    },
+                )
+                .returning(CodeSymbol.id, CodeSymbol.qualified_name)
+            )
+            ret = await session.execute(stmt)
+            row = ret.one()
+            file_symbol_ids[row.qualified_name] = row.id
+            repo_symbols[row.qualified_name] = row.id
+
+        # Tombstone symbols removed from this file
+        if current_qnames:
+            await session.execute(
+                update(CodeSymbol)
+                .where(
+                    CodeSymbol.file_id == file_id,
+                    CodeSymbol.deleted_at.is_(None),
+                    ~CodeSymbol.qualified_name.in_(current_qnames),
+                )
+                .values(deleted_at=func.now())
+            )
+
+        # Delete outgoing edges for this file's symbols
+        await session.execute(
+            delete(SymbolEdge).where(
+                SymbolEdge.source_symbol_id.in_(
+                    select(CodeSymbol.id).where(CodeSymbol.file_id == file_id)
+                )
+            )
         )
 
-        # Tombstone files that disappeared from GitHub (history is kept).
-        cur.execute(
-            """
-            UPDATE repo_files SET deleted_at = now(), updated_at = now()
-            WHERE repo_id = %s AND deleted_at IS NULL AND NOT (path = ANY(%s))
-            """,
-            (repo_id, live_paths),
+        # Insert new edges
+        for edge in parse_result.edges:
+            source_id = file_symbol_ids.get(edge.source_qualified_name)
+            if not source_id:
+                continue
+
+            target_id = _resolve_target(
+                edge.source_qualified_name,
+                edge.target_name,
+                parse_result.imported_names,
+                repo_symbols,
+            )
+
+            stmt = (
+                pg_insert(SymbolEdge)
+                .values(
+                    repo_id=repo_id,
+                    source_symbol_id=source_id,
+                    target_symbol_id=target_id,
+                    target_name=edge.target_name,
+                    relation=edge.relation,
+                    call_line=edge.call_line,
+                )
+                .on_conflict_do_update(
+                    index_elements=[
+                        SymbolEdge.source_symbol_id,
+                        SymbolEdge.target_name,
+                        SymbolEdge.relation,
+                        SymbolEdge.call_line,
+                    ],
+                    set_={"target_symbol_id": target_id},
+                )
+            )
+            await session.execute(stmt)
+
+        await session.commit()
+
+    # Repo-wide pass resolving unresolved edges
+    await _resolve_unresolved_edges(session, repo_id)
+
+
+def _resolve_target(
+    source_qname: str,
+    target_name: str,
+    imported_names: dict[str, str],
+    repo_symbols: dict[str, int],
+) -> int | None:
+    """Resolve target symbol id using the 5-step resolution rules."""
+    # 1. Same-class self.method
+    if target_name.startswith("self."):
+        method_name = target_name[len("self."):]
+        parts = source_qname.split(".")
+        if len(parts) >= 2:
+            class_qname = ".".join(parts[:-1])
+            candidate = f"{class_qname}.{method_name}"
+            if candidate in repo_symbols:
+                return repo_symbols[candidate]
+
+    # 2. Same-module names
+    module_parts = source_qname.split(".")
+    # If source is a method (module.Class.method), module is module_parts[:-2]
+    # If source is function/class (module.func), module is module_parts[:-1]
+    if len(module_parts) > 1:
+        # Try parent scopes
+        for i in range(len(module_parts) - 1, 0, -1):
+            parent_scope = ".".join(module_parts[:i])
+            candidate = f"{parent_scope}.{target_name}"
+            if candidate in repo_symbols:
+                return repo_symbols[candidate]
+
+    # 3. Imported names resolved to repo_files paths
+    if target_name in imported_names:
+        imported_target = imported_names[target_name]
+        if imported_target in repo_symbols:
+            return repo_symbols[imported_target]
+        # Also check if imported target matches a class and call is method: e.g. alias.method
+    for alias, full_import in imported_names.items():
+        if target_name.startswith(f"{alias}."):
+            remainder = target_name[len(f"{alias}."):]
+            candidate = f"{full_import}.{remainder}"
+            if candidate in repo_symbols:
+                return repo_symbols[candidate]
+
+    # 4. Direct exact qualified_name match
+    if target_name in repo_symbols:
+        return repo_symbols[target_name]
+
+    # 5. Unique name match in repo symbols
+    short_target = target_name.split(".")[-1]
+    matches = [
+        sym_id
+        for qname, sym_id in repo_symbols.items()
+        if qname.endswith(f".{short_target}") or qname == short_target
+    ]
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
+async def _resolve_unresolved_edges(session: AsyncSession, repo_id: int) -> None:
+    """Repo-wide pass that resolves symbol_edges where target_symbol_id IS NULL."""
+    symbols_res = await session.execute(
+        select(CodeSymbol.id, CodeSymbol.name, CodeSymbol.qualified_name).where(
+            CodeSymbol.repo_id == repo_id, CodeSymbol.deleted_at.is_(None)
         )
+    )
+    repo_symbols = {row.qualified_name: row.id for row in symbols_res}
 
-        cur.execute("UPDATE repositories SET last_indexed_sha = %s WHERE id = %s", (commit_sha, repo_id))
+    # Group by short name for unique resolution
+    name_to_ids = defaultdict(list)
+    for qname, sym_id in repo_symbols.items():
+        name = qname.split(".")[-1]
+        name_to_ids[name].append(sym_id)
 
-    # Hand changed Python files to the Tree-sitter indexer (Person 1).
-    changed = conn.execute(
-        """
-        SELECT id, path FROM repo_files
-        WHERE repo_id = %s AND language = 'python' AND deleted_at IS NULL AND indexed_sha = %s
-        """,
-        (repo_id, commit_sha),
-    ).fetchall()
-    index_symbols(conn, token, repo_id, owner, name, commit_sha, changed)
+    unresolved_query = select(SymbolEdge.id, SymbolEdge.target_name).where(
+        SymbolEdge.repo_id == repo_id, SymbolEdge.target_symbol_id.is_(None)
+    )
+    unresolved_edges = (await session.execute(unresolved_query)).all()
 
+    for edge in unresolved_edges:
+        target_name = edge.target_name
+        resolved_id = repo_symbols.get(target_name)
+        if not resolved_id:
+            short_name = target_name.split(".")[-1]
+            candidates = name_to_ids.get(short_name, [])
+            if len(candidates) == 1:
+                resolved_id = candidates[0]
 
-def index_symbols(conn, token, repo_id, owner, name, commit_sha, files) -> None:
-    """
-    PLACEHOLDER for the Tree-sitter step (code_symbols + symbol_edges).
-    For each (file_id, path) in `files`:
-      1. download the file:  GET /repos/{owner}/{name}/contents/{path}?ref={commit_sha}
-      2. parse functions/classes with Tree-sitter
-      3. upsert into code_symbols on (file_id, qualified_name, kind)
-      4. delete + re-insert that file's outgoing symbol_edges
-      5. re-resolve edges where target_symbol_id IS NULL
-    """
-    pass
+        if resolved_id:
+            await session.execute(
+                update(SymbolEdge)
+                .where(SymbolEdge.id == edge.id)
+                .values(target_symbol_id=resolved_id)
+            )
+
+    await session.commit()
 
 
 # ---------------------------------------------------------------- Entry point
-def index_user_installation(installation_id: int) -> None:
-    """
-    Call this in a background task:
-      - right after the user installs the GitHub App / finishes login
-      - on the `installation` (created) and `installation_repositories` (added) webhooks
-    """
-    token = get_installation_token(installation_id)
-    with psycopg.connect(DATABASE_URL) as conn:
-        repo_ids = sync_installation_repos(conn, token, installation_id)
-        conn.commit()
-        for repo_id in repo_ids:
+async def index_user_installation(installation_id: int, user_id: int | None = None) -> None:
+    """Background task entry point: index only selected repositories for an installation."""
+    maker = get_sessionmaker()
+    token = await github_app.get_installation_token(installation_id)
+
+    async with maker() as session:
+        # 1. Sync repositories accessible by this installation
+        synced_repos = await sync_installation_repos(session, token, installation_id)
+
+        # 2. Filter to ONLY repos in selected_repositories for that user and installation
+        if user_id is not None:
+            selected_stmt = select(SelectedRepository.repo_id).where(
+                SelectedRepository.user_id == user_id,
+                SelectedRepository.installation_id == installation_id,
+            )
+        else:
+            selected_stmt = select(SelectedRepository.repo_id).where(
+                SelectedRepository.installation_id == installation_id
+            )
+
+        selected_github_ids = set((await session.execute(selected_stmt)).scalars().all())
+
+        # If user has specific selections, filter to those; otherwise skip unselected
+        target_repos = [
+            r for r in synced_repos if r["github_repo_id"] in selected_github_ids
+        ]
+
+        logger.info(
+            "Indexing %d selected repositories for installation %d (user %s)",
+            len(target_repos),
+            installation_id,
+            user_id,
+        )
+
+        for repo_info in target_repos:
+            repo_id = repo_info["id"]
             try:
-                index_repo(conn, token, repo_id)
-                conn.commit()
-            except Exception as exc:        # one bad repo must not stop the others
-                conn.rollback()
-                print(f"index failed for repo {repo_id}: {exc}")
+                await index_repo(session, token, repo_id)
+                logger.info("Successfully indexed repo %s/%s", repo_info["owner"], repo_info["name"])
+            except Exception as exc:
+                logger.exception("Failed to index repo %s (id %s): %s", repo_info.get("name"), repo_id, exc)
 
 
-# ---------------------------------------------------------------- Wiring example (FastAPI)
-# from fastapi import BackgroundTasks
-#
-# @router.get("/auth/github/callback")
-# def callback(..., background: BackgroundTasks):
-#     ...  # upsert user, create session, upsert user_installations / selected_repositories
-#     background.add_task(index_user_installation, installation_id)
-#     return RedirectResponse("/dashboard")
+async def index_single_repository(repo_id: int) -> None:
+    """Index or re-index a single repository by its local primary key."""
+    maker = get_sessionmaker()
+    async with maker() as session:
+        repo = (
+            await session.execute(select(Repository).where(Repository.id == repo_id))
+        ).scalar_one_or_none()
+        if not repo:
+            raise ValueError(f"Repository {repo_id} not found")
+        if not repo.installation_id:
+            raise ValueError(f"Repository {repo_id} has no installation_id")
+
+        token = await github_app.get_installation_token(repo.installation_id)
+        await index_repo(session, token, repo_id)

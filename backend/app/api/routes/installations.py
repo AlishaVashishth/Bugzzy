@@ -15,10 +15,12 @@ trusted on its own.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from app.api.deps import get_current_user, verify_csrf
+from app.db.postgres_store import PostgresStore
+from app.indexer.repo_indexer import index_user_installation
 from app.services import github_app
 from app.services.github_app import (
     GitHubAPIError,
@@ -89,6 +91,7 @@ async def install_url(user: dict = Depends(get_current_user)) -> JSONResponse:
 @router.post("/{installation_id}/connect")
 async def connect_installation(
     installation_id: int,
+    background_tasks: BackgroundTasks,
     user: dict = Depends(get_current_user),
     _csrf: None = Depends(verify_csrf),
     store: Store = Depends(get_store),
@@ -121,6 +124,12 @@ async def connect_installation(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Installation not found",
         )
+
+    if isinstance(store, PostgresStore):
+        background_tasks.add_task(
+            index_user_installation, installation_id, user["id"]
+        )
+
     return JSONResponse(
         content={
             "connected_installation_id": installation_id,

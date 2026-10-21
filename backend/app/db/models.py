@@ -44,11 +44,13 @@ class User(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     github_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
     username: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str | None] = mapped_column(Text)
     email: Mapped[str | None] = mapped_column(Text)
     avatar_url: Mapped[str | None] = mapped_column(Text)
     encrypted_token: Mapped[bytes | None] = mapped_column(LargeBinary)
     role: Mapped[str] = mapped_column(Text, nullable=False, server_default="user")
     created_at: Mapped[datetime] = _ts()
+    updated_at: Mapped[datetime] = _ts()
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")

@@ -11,11 +11,16 @@ returned to the browser.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 
 from app.api.deps import get_current_user, verify_csrf
+from app.db.engine import get_sessionmaker
+from app.db.models import CodeSymbol, RepoFile, Repository, SymbolEdge
+from app.db.postgres_store import PostgresStore
+from app.indexer.repo_indexer import index_single_repository, index_user_installation
 from app.services.github_app import (
     GitHubAPIError,
     GitHubAuthError,
@@ -151,6 +156,7 @@ async def list_repositories(
 @router.post("/select")
 async def select_repositories(
     body: RepositorySelectRequest,
+    background_tasks: BackgroundTasks,
     user: dict = Depends(get_current_user),
     _csrf: None = Depends(verify_csrf),
     store: Store = Depends(get_store),
@@ -186,4 +192,139 @@ async def select_repositories(
     await store.set_selected_repositories(
         user["id"], installation_id, unique_ids
     )
+
+    if unique_ids and isinstance(store, PostgresStore):
+        background_tasks.add_task(
+            index_user_installation, installation_id, user["id"]
+        )
+
     return JSONResponse(content={"selected_repository_ids": unique_ids})
+
+
+@router.post("/{repo_id}/index")
+async def trigger_reindex(
+    repo_id: int,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+    _csrf: None = Depends(verify_csrf),
+    store: Store = Depends(get_store),
+) -> JSONResponse:
+    """Trigger a reindex of a repository.
+
+    Allowed only if the user has the repo in selected_repositories.
+    """
+    installation_id = await store.get_connected_installation(user["id"])
+    if installation_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No GitHub installation connected",
+        )
+
+    selected_repo_ids = await store.get_selected_repositories(
+        user["id"], installation_id
+    )
+
+    maker = get_sessionmaker()
+    async with maker() as session:
+        repo = (
+            await session.execute(
+                select(Repository).where(
+                    (Repository.id == repo_id) | (Repository.github_repo_id == repo_id)
+                )
+            )
+        ).scalar_one_or_none()
+
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found",
+        )
+
+    if (
+        repo.github_repo_id not in selected_repo_ids
+        and repo.id not in selected_repo_ids
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Repository is not selected for this user",
+        )
+
+    background_tasks.add_task(index_single_repository, repo.id)
+    return JSONResponse(
+        content={"detail": "Reindexing scheduled", "repo_id": repo.id}
+    )
+
+
+@router.get("/{repo_id}/index")
+async def get_repository_index_counts(
+    repo_id: int,
+    user: dict = Depends(get_current_user),
+    _store: Store = Depends(get_store),
+) -> JSONResponse:
+    """Return index counts for a repository (files, symbols, edges, unresolved_edges, last_indexed_sha)."""
+    maker = get_sessionmaker()
+    async with maker() as session:
+        repo = (
+            await session.execute(
+                select(Repository).where(
+                    (Repository.id == repo_id) | (Repository.github_repo_id == repo_id)
+                )
+            )
+        ).scalar_one_or_none()
+
+        if not repo:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Repository not found",
+            )
+
+        target_repo_id = repo.id
+
+        files_count = (
+            await session.execute(
+                select(func.count(RepoFile.id)).where(
+                    RepoFile.repo_id == target_repo_id,
+                    RepoFile.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one()
+
+        symbols_count = (
+            await session.execute(
+                select(func.count(CodeSymbol.id)).where(
+                    CodeSymbol.repo_id == target_repo_id,
+                    CodeSymbol.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one()
+
+        edges_count = (
+            await session.execute(
+                select(func.count(SymbolEdge.id)).where(
+                    SymbolEdge.repo_id == target_repo_id
+                )
+            )
+        ).scalar_one()
+
+        unresolved_count = (
+            await session.execute(
+                select(func.count(SymbolEdge.id)).where(
+                    SymbolEdge.repo_id == target_repo_id,
+                    SymbolEdge.target_symbol_id.is_(None),
+                )
+            )
+        ).scalar_one()
+
+    return JSONResponse(
+        content={
+            "repo_id": target_repo_id,
+            "github_repo_id": repo.github_repo_id,
+            "owner": repo.owner,
+            "name": repo.name,
+            "files": files_count,
+            "symbols": symbols_count,
+            "edges": edges_count,
+            "unresolved_edges": unresolved_count,
+            "last_indexed_sha": repo.last_indexed_sha,
+        }
+    )
