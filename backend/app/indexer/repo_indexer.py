@@ -310,6 +310,8 @@ async def index_symbols(
     )
     repo_symbols = {row.qualified_name: row.id for row in existing_symbols_res}
 
+    parsed_files: list[tuple[int, Any, dict[str, int]]] = []
+
     for file_info in changed_files:
         file_id = file_info["id"]
         file_path = file_info["path"]
@@ -382,6 +384,31 @@ async def index_symbols(
                 .values(deleted_at=func.now())
             )
 
+        parsed_files.append((file_id, parse_result, file_symbol_ids))
+        await session.commit()
+
+    # Phase 2: save edges only after every file's symbols exist, so a call can
+    # point at a definition in a file that sorts later than the caller.
+    await _link_edges(session, repo_id, parsed_files)
+
+    # Repo-wide pass resolving unresolved edges
+    await _resolve_unresolved_edges(session, repo_id)
+
+
+async def _link_edges(
+    session: AsyncSession,
+    repo_id: int,
+    parsed_files: list[tuple[int, Any, dict[str, int]]],
+) -> None:
+    """Phase 2 of symbol indexing: save call/import edges for parsed files."""
+    symbols_res = await session.execute(
+        select(CodeSymbol.id, CodeSymbol.name, CodeSymbol.qualified_name).where(
+            CodeSymbol.repo_id == repo_id, CodeSymbol.deleted_at.is_(None)
+        )
+    )
+    repo_symbols = {row.qualified_name: row.id for row in symbols_res}
+
+    for file_id, parse_result, file_symbol_ids in parsed_files:
         # Delete outgoing edges for this file's symbols
         await session.execute(
             delete(SymbolEdge).where(
@@ -432,9 +459,6 @@ async def index_symbols(
             await session.execute(stmt)
 
         await session.commit()
-
-    # Repo-wide pass resolving unresolved edges
-    await _resolve_unresolved_edges(session, repo_id)
 
 
 def _resolve_target(
