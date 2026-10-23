@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -28,6 +29,7 @@ from app.services.github_app import get_installation_token
 from app.services.pr_files import fetch_pr_files
 from app.services.pr_changes import analyze_pr_files, load_symbols_by_path
 from app.services.engine_review import run_engine_review
+from app.services.pr_comments import upsert_review_comment
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,11 @@ async def _safe_index_user_installation(installation_id: int) -> None:
         await index_user_installation(installation_id)
     except Exception:
         logger.exception("Indexing failed for installation %s", installation_id)
+
+
+def _comments_enabled() -> bool:
+    """Posting comments to GitHub is opt-in: set BUGZZY_POST_COMMENTS=1."""
+    return os.getenv("BUGZZY_POST_COMMENTS", "").strip() == "1"
 
 
 async def _review_pull_request(github_repo_id: int, pr_number: int, action: str) -> None:
@@ -171,6 +178,16 @@ async def _review_pull_request(github_repo_id: int, pr_number: int, action: str)
                 f["severity"],
                 f["confidence"],
             )
+        if _comments_enabled():
+            try:
+                outcome = await upsert_review_comment(
+                    token, repo.owner, repo.name, pr_number, findings
+                )
+                logger.info("Review comment %s on PR #%s", outcome, pr_number)
+            except Exception:
+                logger.exception("Posting review comment failed for PR #%s", pr_number)
+        else:
+            logger.info("Comment posting is off (set BUGZZY_POST_COMMENTS=1 to turn it on)")
     except Exception:
         logger.exception("Review failed for PR #%s in repository %s", pr_number, github_repo_id)
 

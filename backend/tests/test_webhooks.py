@@ -37,6 +37,8 @@ def isolate(monkeypatch):
     monkeypatch.setattr(webhooks, "index_user_installation", AsyncMock())
     monkeypatch.setattr(webhooks, "get_sessionmaker", _no_database)
     monkeypatch.setattr(webhooks, "run_engine_review", lambda *a, **k: [])
+    monkeypatch.setattr(webhooks, "upsert_review_comment", AsyncMock(return_value="skipped"))
+    monkeypatch.delenv("BUGZZY_POST_COMMENTS", raising=False)
     webhooks._recent_deliveries.clear()
 
 
@@ -329,3 +331,46 @@ def test_review_pull_request_survives_an_engine_failure(monkeypatch):
     _engine_ready_monkeypatch(monkeypatch, engine)
     asyncio.run(webhooks._review_pull_request(123, 5, "opened"))
     engine.assert_called_once()
+
+
+_COMMENT_FINDING = {
+    "finding_id": "BUG-001",
+    "file_path": "billing.py",
+    "start_line": 7,
+    "end_line": 7,
+    "summary": "Incompatible call",
+    "severity": "high",
+    "confidence": "strong",
+}
+
+
+def test_review_pull_request_posts_comment_when_enabled(monkeypatch):
+    from unittest.mock import MagicMock
+
+    _engine_ready_monkeypatch(monkeypatch, MagicMock(return_value=[_COMMENT_FINDING]))
+    upsert = AsyncMock(return_value="created")
+    monkeypatch.setattr(webhooks, "upsert_review_comment", upsert)
+    monkeypatch.setenv("BUGZZY_POST_COMMENTS", "1")
+    asyncio.run(webhooks._review_pull_request(123, 5, "opened"))
+    upsert.assert_awaited_once_with("tok", "Amvi3007", "Testing", 5, [_COMMENT_FINDING])
+
+
+def test_review_pull_request_does_not_post_by_default(monkeypatch):
+    from unittest.mock import MagicMock
+
+    _engine_ready_monkeypatch(monkeypatch, MagicMock(return_value=[_COMMENT_FINDING]))
+    upsert = AsyncMock(return_value="created")
+    monkeypatch.setattr(webhooks, "upsert_review_comment", upsert)
+    asyncio.run(webhooks._review_pull_request(123, 5, "opened"))
+    upsert.assert_not_awaited()
+
+
+def test_review_pull_request_survives_a_comment_failure(monkeypatch):
+    from unittest.mock import MagicMock
+
+    _engine_ready_monkeypatch(monkeypatch, MagicMock(return_value=[_COMMENT_FINDING]))
+    upsert = AsyncMock(side_effect=RuntimeError("403 forbidden"))
+    monkeypatch.setattr(webhooks, "upsert_review_comment", upsert)
+    monkeypatch.setenv("BUGZZY_POST_COMMENTS", "1")
+    asyncio.run(webhooks._review_pull_request(123, 5, "opened"))
+    upsert.assert_awaited_once()
