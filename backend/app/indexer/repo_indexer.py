@@ -24,6 +24,13 @@ from app.db.engine import get_sessionmaker
 from app.db.models import CodeSymbol, RepoFile, Repository, SelectedRepository, SymbolEdge
 from app.indexer.python_parser import ParseResult, parse_python_source
 from app.services import github_app
+import builtins
+
+_PYTHON_BUILTINS = frozenset(dir(builtins))
+
+def _is_builtin(name: str) -> bool:
+    """True for bare built-in names like round, len, ValueError."""
+    return "." not in name and name in _PYTHON_BUILTINS
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +405,9 @@ async def index_symbols(
                 repo_symbols,
                 raw_target=raw_target,
             )
+            # Built-ins can never be in the repo, so don't store them as gaps.
+            if target_id is None and _is_builtin(raw_target):
+                continue
 
             stmt = (
                 pg_insert(SymbolEdge)
