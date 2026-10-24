@@ -28,6 +28,7 @@ from app.indexer.repo_indexer import index_single_repository, index_user_install
 from app.services.github_app import get_installation_token
 from app.services.pr_files import fetch_pr_files
 from app.services.pr_changes import analyze_pr_files, load_symbols_by_path
+from pr_context_builder.index.postgres_index import PostgresCallerIndex
 from app.services.engine_review import run_engine_review
 from app.services.pr_comments import upsert_review_comment
 
@@ -156,9 +157,27 @@ async def _review_pull_request(github_repo_id: int, pr_number: int, action: str)
 
         # The engine does blocking network calls, so run it in a worker thread
         # to keep the server responsive for everyone else.
+        caller_index = None
+        try:
+            db_url = get_settings().database_url
+            if db_url:
+                # The engine needs a plain postgresql:// URL, not the SQLAlchemy one.
+                plain_url = db_url.replace("postgresql+psycopg://", "postgresql://", 1)
+                caller_index = PostgresCallerIndex(plain_url)
+        except Exception as exc:
+            logger.warning(
+                "Could not build caller index (%s); continuing without it",
+                type(exc).__name__,
+            )
+
         try:
             findings = await asyncio.to_thread(
-                run_engine_review, repo.owner, repo.name, pr_number, token
+                run_engine_review,
+                repo.owner,
+                repo.name,
+                pr_number,
+                token,
+                caller_index=caller_index,
             )
         except Exception:
             logger.exception(

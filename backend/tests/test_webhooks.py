@@ -321,7 +321,7 @@ def test_review_pull_request_runs_the_engine_with_the_token(monkeypatch):
     engine = MagicMock(return_value=[finding])
     _engine_ready_monkeypatch(monkeypatch, engine)
     asyncio.run(webhooks._review_pull_request(123, 5, "opened"))
-    engine.assert_called_once_with("Amvi3007", "Testing", 5, "tok")
+    engine.assert_called_once_with("Amvi3007", "Testing", 5, "tok", caller_index=None)
 
 
 def test_review_pull_request_survives_an_engine_failure(monkeypatch):
