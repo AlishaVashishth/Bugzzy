@@ -17,6 +17,8 @@ from app.api.deps import get_current_user
 from app.api.routes.auth import router as auth_router
 from app.api.routes.installations import router as installations_router
 from app.api.routes.repositories import router as repositories_router
+from app.api.routes.webhooks import router as webhooks_router
+from app.api.routes.analysis import router as analysis_router
 from app.config import get_settings
 from app.services.github_app import (
     GitHubAPIError,
@@ -61,6 +63,10 @@ app.include_router(installations_router)
 
 # Register the repository routes (/api/v1/repositories/...).
 app.include_router(repositories_router)
+
+# Register the analysis routes (/api/v1/analysis/...).
+app.include_router(analysis_router)
+app.include_router(webhooks_router)
 
 
 @app.get("/api/v1/health")
